@@ -30,6 +30,7 @@ def init_session_state():
             "Min nm": [400, 600],
             "Max nm": [750, 750],
         }),
+        "er_last_analysis_signature": None,
     }
 
     for key, value in defaults.items():
@@ -45,6 +46,7 @@ def reset_app_state():
     st.session_state.er_warnings_df = pd.DataFrame()
     st.session_state.er_details = {}
     st.session_state.er_thickness_editor_df = pd.DataFrame()
+    st.session_state.er_last_analysis_signature = None
     st.session_state.er_uploader_key_counter += 1
     st.session_state.er_thickness_csv_key_counter += 1
 
@@ -72,7 +74,6 @@ def reset_app_state():
         if key in st.session_state:
             del st.session_state[key]
 
-    # Delete dynamic checkbox keys.
     for key in list(st.session_state.keys()):
         if key.startswith("er_manual_y_axis"):
             del st.session_state[key]
@@ -87,15 +88,68 @@ init_session_state()
 # Helpers
 # -------------------------------------------------
 def load_spectrum(uploaded_file, skiprows=1, max_rows=1024):
-    data = np.loadtxt(uploaded_file, skiprows=skiprows, max_rows=max_rows)
+    """
+    Robust spectrum loader.
 
-    if data.ndim != 2 or data.shape[1] < 3:
-        raise ValueError("Spectrum file must contain at least 3 columns.")
+    Expected format:
+    - at least 3 columns
+    - column 0 = channel
+    - column 2 = intensity
 
-    channels = data[:, 0]
-    intensity = data[:, 2]
+    Supports whitespace/tab-separated TXT/DAT and comma-separated CSV.
+    """
+    name = uploaded_file.name.lower()
 
-    return channels, intensity
+    loaders = []
+
+    if name.endswith(".csv"):
+        loaders = [
+            {"delimiter": ","},
+            {"delimiter": None},
+        ]
+    else:
+        loaders = [
+            {"delimiter": None},
+            {"delimiter": ","},
+        ]
+
+    last_error = None
+
+    for loader_kwargs in loaders:
+        try:
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+
+            delimiter = loader_kwargs["delimiter"]
+
+            if delimiter is None:
+                data = np.loadtxt(
+                    uploaded_file,
+                    skiprows=skiprows,
+                    max_rows=max_rows,
+                )
+            else:
+                data = np.loadtxt(
+                    uploaded_file,
+                    skiprows=skiprows,
+                    max_rows=max_rows,
+                    delimiter=delimiter,
+                )
+
+            if data.ndim != 2 or data.shape[1] < 3:
+                raise ValueError("Spectrum file must contain at least 3 columns.")
+
+            channels = data[:, 0]
+            intensity = data[:, 2]
+
+            return channels, intensity
+
+        except Exception as e:
+            last_error = e
+
+    raise ValueError(f"Could not load spectrum file '{uploaded_file.name}': {last_error}")
 
 
 def calculate_wavelengths(channels, center_wavelength=550, grating_number=1):
@@ -126,12 +180,6 @@ def parse_reference_keywords(reference_keywords_text: str):
 
 
 def detect_is_reference(name: str, reference_keywords=None) -> bool:
-    """
-    Safer reference detection.
-    Short keywords such as REF must match a filename token.
-    Longer custom keywords can also match as substrings.
-    Compact names ending in REF, such as PETREF, are also accepted.
-    """
     reference_keywords = reference_keywords or ["REF"]
     n = normalize_name(name)
     tokens = split_name_tokens(name)
@@ -160,7 +208,6 @@ def detect_material_family(name: str):
         if fam in tokens:
             return fam
 
-    # Fallback for compact names like PETREF or PMMAREF.
     for fam in ordered:
         if fam in n:
             return fam
@@ -176,7 +223,6 @@ def extract_sample_name(filename: str):
 
 
 def extract_thickness_from_name(sample_name: str):
-    # Supports names like SAMPLE 1-50-A, SAMPLE 2-100-B, etc.
     wet_to_dry = {
         50: 11.0,
         100: 12.0,
@@ -203,7 +249,6 @@ def match_reference(sample_name: str, available_references: list[str]):
     if not available_references:
         return None, "no_references_uploaded"
 
-    # 1. Same material family.
     if family is not None:
         family_matches = [
             r for r in available_references
@@ -224,7 +269,6 @@ def match_reference(sample_name: str, available_references: list[str]):
 
             return family_matches[0], f"multiple_family_matches:{family}"
 
-    # 2. Generic fallback.
     generic_priority = ["LAM", "PET", "EMA", "PMMA", "PE"]
 
     for fam in generic_priority:
@@ -239,7 +283,6 @@ def match_reference(sample_name: str, available_references: list[str]):
         if len(fam_matches) > 1:
             return fam_matches[0], f"fallback_multiple_family:{fam}"
 
-    # 3. Final fallback.
     return available_references[0], "fallback_first_reference"
 
 
@@ -341,7 +384,6 @@ def make_downloadable_summary(results_long: pd.DataFrame):
     base_cols = [
         "Sample",
         "Reference",
-        "Family",
         "Thickness (µm)",
         "Thickness source",
         "Mean ratio 400-700",
@@ -349,9 +391,29 @@ def make_downloadable_summary(results_long: pd.DataFrame):
         "Max ratio 400-700",
     ]
 
+    # Hide thickness columns if no valid thickness was detected/provided.
+    has_valid_thickness = False
+    if "Thickness (µm)" in results_long.columns:
+        has_valid_thickness = results_long["Thickness (µm)"].notna().any()
+
+    if not has_valid_thickness:
+        base_cols = [
+            c for c in base_cols
+            if c not in ["Thickness (µm)", "Thickness source"]
+        ]
+
     dynamic_cols = [
         c for c in results_long.columns
-        if c not in base_cols
+        if c not in [
+            "Sample",
+            "Reference",
+            "Family",
+            "Thickness (µm)",
+            "Thickness source",
+            "Mean ratio 400-700",
+            "Min ratio 400-700",
+            "Max ratio 400-700",
+        ]
     ]
 
     ordered_cols = [c for c in base_cols if c in results_long.columns] + dynamic_cols
@@ -388,7 +450,8 @@ def band_average(wl, y, lo, hi):
     if abs(width) < 1e-12:
         return np.nan
 
-    return float(np.trapezoid(vals, x) / width)
+    area = np.trapezoid(vals, x) if hasattr(np, "trapezoid") else np.trapz(vals, x)
+    return float(area / width)
 
 
 def clean_metric_bands(metric_bands_df: pd.DataFrame):
@@ -409,7 +472,7 @@ def clean_metric_bands(metric_bands_df: pd.DataFrame):
         if lo == hi:
             continue
 
-        base_name = raw_name
+        base_name = raw_name.strip()
         count = used_names.get(base_name, 0) + 1
         used_names[base_name] = count
 
@@ -422,6 +485,13 @@ def clean_metric_bands(metric_bands_df: pd.DataFrame):
         })
 
     return bands
+
+
+def metric_bands_signature(metric_bands):
+    return tuple(
+        (band["name"], round(float(band["lo"]), 6), round(float(band["hi"]), 6))
+        for band in metric_bands
+    )
 
 
 def compute_custom_band_metrics(wl, ratio, metric_bands):
@@ -792,7 +862,7 @@ with left:
         key=f"er_measurement_files_{st.session_state.er_uploader_key_counter}",
     )
 
-    if st.button("Clear uploaded files", type="secondary", width="stretch"):
+    if st.button("Clear uploaded files", type="secondary"):
         reset_app_state()
         st.rerun()
 
@@ -868,7 +938,7 @@ with left:
     metric_bands_df = st.data_editor(
         st.session_state.er_metric_bands_df,
         num_rows="dynamic",
-        width="stretch",
+        use_container_width=True,
         key="er_metric_bands_editor",
         column_config={
             "Metric name": st.column_config.TextColumn(
@@ -895,6 +965,9 @@ with left:
 
     st.session_state.er_metric_bands_df = metric_bands_df.copy()
     metric_bands = clean_metric_bands(metric_bands_df)
+    current_metric_signature = metric_bands_signature(metric_bands)
+
+    st.caption("After changing metric bands, rerun the enhancement analysis to update the summary table.")
 
     show_metric_bands = st.toggle(
         "Show integration bands on graphs",
@@ -916,13 +989,11 @@ with left:
     preview = st.button(
         "Build / rebuild review table",
         type="secondary",
-        width="stretch",
     )
 
     run_analysis = st.button(
         "Run enhancement analysis",
         type="primary",
-        width="stretch",
     )
 
 
@@ -963,7 +1034,6 @@ with right:
                     "File",
                     "Parsed name",
                     "Type",
-                    "Family",
                     "Matched reference",
                     "Thickness (µm)",
                     "Thickness source",
@@ -979,12 +1049,12 @@ with right:
             "Manual edits in this table are preserved during analysis. Use Type to mark references, and Matched reference to correct pairings."
         )
 
-        disabled_cols = ["File", "Parsed name", "Family", "Thickness source"]
+        disabled_cols = ["File", "Parsed name", "Thickness source"]
         reference_options = [""] + st.session_state.er_thickness_editor_df["Parsed name"].tolist()
 
         edited_df = st.data_editor(
             st.session_state.er_thickness_editor_df,
-            width="stretch",
+            use_container_width=True,
             num_rows="fixed",
             key="er_data_editor",
             disabled=disabled_cols,
@@ -1015,7 +1085,25 @@ with right:
             data=review_csv,
             file_name="enhancement_ratio_thickness_review.csv",
             mime="text/csv",
-            width="stretch",
+        )
+
+    current_analysis_signature = {
+        "center_wavelength": center_wavelength,
+        "grating_number": grating_number,
+        "metric_bands": current_metric_signature,
+        "matching_mode": matching_mode,
+        "reference_keywords": tuple(reference_keywords),
+    }
+
+    if (
+        st.session_state.er_results_ready
+        and st.session_state.er_last_analysis_signature is not None
+        and st.session_state.er_last_analysis_signature != current_analysis_signature
+    ):
+        st.warning(
+            "Some left-side settings changed after the last analysis. "
+            "The graphs may update visually, but the summary table values are from the previous run. "
+            "Click 'Run enhancement analysis' again to recalculate everything."
         )
 
     if run_analysis:
@@ -1044,14 +1132,12 @@ with right:
                         "File",
                         "Parsed name",
                         "Type",
-                        "Family",
                         "Matched reference",
                         "Thickness (µm)",
                         "Thickness source",
                     ]
                 ].copy()
 
-            # The edited table is the source of truth.
             review_df = editor_df.copy()
             review_df["Reference match reason"] = "manual_or_reviewed"
 
@@ -1079,8 +1165,6 @@ with right:
                     "plot_raw": plot_raw,
                     "solve_thickness": solve_thickness,
                     "run_simulation": run_simulation,
-                    "metric_bands": metric_bands,
-                    "show_metric_bands": show_metric_bands,
                 }
                 st.session_state.er_results_ready = True
                 st.warning(
@@ -1110,7 +1194,6 @@ with right:
 
                 sample_name = row.get("Parsed name")
                 ref_name = row.get("Matched reference")
-                family = row.get("Family")
                 thickness = safe_float_or_nan(row.get("Thickness (µm)"))
                 thickness_source = row.get("Thickness source")
 
@@ -1149,12 +1232,6 @@ with right:
                 ref_file = file_lookup[ref_name]
 
                 try:
-                    try:
-                        sample_file.seek(0)
-                        ref_file.seek(0)
-                    except Exception:
-                        pass
-
                     channels_s, sample_i = load_spectrum(sample_file)
                     channels_r, ref_i = load_spectrum(ref_file)
 
@@ -1206,7 +1283,6 @@ with right:
                     result_row = {
                         "Sample": sample_name,
                         "Reference": ref_name,
-                        "Family": family,
                         "Thickness (µm)": thickness,
                         "Thickness source": thickness_source,
                         "Mean ratio 400-700": mean_ratio,
@@ -1228,7 +1304,6 @@ with right:
                         "mu_lambda": mu_lambda,
                         "sample_name": sample_name,
                         "ref_name": ref_name,
-                        "family": family,
                         "thickness": thickness,
                         "metric_values": metric_values,
                         "sfqy": sfqy,
@@ -1283,6 +1358,7 @@ with right:
                 "show_metric_bands": show_metric_bands,
             }
             st.session_state.er_results_ready = True
+            st.session_state.er_last_analysis_signature = current_analysis_signature
 
         except Exception as e:
             st.error(f"Error while running enhancement analysis: {e}")
@@ -1299,8 +1375,11 @@ with right:
         plot_raw_state = details_state.get("plot_raw", False)
         solve_thickness_state = details_state.get("solve_thickness", False)
         run_simulation_state = details_state.get("run_simulation", False)
-        metric_bands_state = details_state.get("metric_bands", metric_bands)
-        show_metric_bands_state = details_state.get("show_metric_bands", show_metric_bands)
+
+        # Use current bands for visual graph shading so the left-side toggle feels responsive.
+        # Numerical table values are recalculated only when Run enhancement analysis is clicked.
+        metric_bands_visual = metric_bands
+        show_metric_bands_visual = show_metric_bands
 
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "Summary",
@@ -1317,7 +1396,7 @@ with right:
             if summary_df.empty:
                 st.info("No results generated.")
             else:
-                st.dataframe(summary_df, width="stretch")
+                st.dataframe(summary_df, use_container_width=True)
 
                 csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
 
@@ -1326,12 +1405,11 @@ with right:
                     data=csv_bytes,
                     file_name="enhancement_ratio_summary.csv",
                     mime="text/csv",
-                    width="stretch",
                 )
 
         with tab2:
             st.subheader("Parsed files and matching")
-            st.dataframe(review_df, width="stretch")
+            st.dataframe(review_df, use_container_width=True)
 
         with tab3:
             st.subheader("Interactive graphs")
@@ -1467,8 +1545,8 @@ with right:
                             d_ref=d_ref,
                             x_range=[x_min, x_max],
                             y_range=y_range,
-                            show_metric_bands=show_metric_bands_state,
-                            metric_bands=metric_bands_state,
+                            show_metric_bands=show_metric_bands_visual,
+                            metric_bands=metric_bands_visual,
                         )
 
                         st.plotly_chart(fig, use_container_width=True)
@@ -1476,6 +1554,12 @@ with right:
                     st.subheader("Selected sample details")
 
                     detail_rows = []
+                    selected_has_thickness = False
+
+                    for s in selected_samples:
+                        d = details[s]
+                        if pd.notna(d.get("thickness")):
+                            selected_has_thickness = True
 
                     for s in selected_samples:
                         d = details[s]
@@ -1483,16 +1567,17 @@ with right:
                         detail_row = {
                             "Sample": d["sample_name"],
                             "Reference": d["ref_name"],
-                            "Family": d["family"],
-                            "Thickness (µm)": d["thickness"],
                         }
+
+                        if selected_has_thickness:
+                            detail_row["Thickness (µm)"] = d.get("thickness")
 
                         detail_row.update(d.get("metric_values", {}))
                         detail_row["SFQY"] = d.get("sfqy", np.nan)
 
                         detail_rows.append(detail_row)
 
-                    st.dataframe(pd.DataFrame(detail_rows), width="stretch")
+                    st.dataframe(pd.DataFrame(detail_rows), use_container_width=True)
 
         with tab4:
             st.subheader("Spectra viewer")
@@ -1604,8 +1689,8 @@ with right:
                         spectra_mode=spectra_mode,
                         x_range=[viewer_x_min, viewer_x_max],
                         y_range=viewer_y_range,
-                        show_metric_bands=show_metric_bands_state,
-                        metric_bands=metric_bands_state,
+                        show_metric_bands=show_metric_bands_visual,
+                        metric_bands=metric_bands_visual,
                     )
 
                     st.plotly_chart(viewer_fig, use_container_width=True)
@@ -1682,14 +1767,13 @@ with right:
                     "T_sim_upper": simulation["upper"],
                 })
 
-                st.dataframe(sim_df, width="stretch")
+                st.dataframe(sim_df, use_container_width=True)
 
                 st.download_button(
                     "Download simulation CSV",
                     data=sim_df.to_csv(index=False).encode("utf-8"),
                     file_name="enhancement_ratio_simulation.csv",
                     mime="text/csv",
-                    width="stretch",
                 )
 
         with tab6:
@@ -1698,7 +1782,7 @@ with right:
             if warnings_df.empty:
                 st.success("No warnings.")
             else:
-                st.dataframe(warnings_df, width="stretch")
+                st.dataframe(warnings_df, use_container_width=True)
 
     else:
         st.info(
