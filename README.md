@@ -1,2 +1,1 @@
-# PLQY-SolarFoil
-Second version of PLQY App. Batch Analysis 
+Testing new features 
